@@ -686,17 +686,26 @@ def _hook_collect_transcript_commands(transcript_path: Path) -> list[str] | None
     # tool_use_id is None for a block missing or misshaping its own id: kept
     # in the requested list regardless (never silently dropped for that),
     # just ineligible to ever match an entry in denied_ids.
-    requested: list[tuple[str | None, str, int]] = []
-    edit_positions: dict[str | None, int] = {}
+    requested_ids: list[str | None] = []
+    commands: list[str] = []
+    # Each edit records how many commands were requested before it, so the
+    # commands after the last edit are just the tail of `commands`.
+    edit_cutoffs: dict[str | None, int] = {}
     denied_ids: set[str] = set()
-    position = 0
+    # Blank lines need no separate check: decoding one fails like any other malformed line.
+    decoder = json.JSONDecoder()
     for line in lines:
-        if not line.strip():
-            continue
+        # Most lines are exactly one JSON value, which raw_decode parses without
+        # decode's whitespace scanning; anything else falls back to decode.
         try:
-            record = json.loads(line)
+            record, end = decoder.raw_decode(line)
         except ValueError:
-            continue
+            end = -1
+        if end != len(line):
+            try:
+                record = decoder.decode(line)
+            except ValueError:
+                continue
         if not isinstance(record, dict) or record.get("isSidechain"):
             continue
         message = record.get("message")
@@ -707,31 +716,35 @@ def _hook_collect_transcript_commands(transcript_path: Path) -> list[str] | None
             if not isinstance(block, dict):
                 continue
             block_type = block.get("type")
-            if block_type == "tool_use" and block.get("name") == "Bash":
-                tool_input = block.get("input")
-                command = tool_input.get("command") if isinstance(tool_input, dict) else None
-                if isinstance(command, str) and command:
-                    position += 1
+            if block_type == "tool_use":
+                name = block.get("name")
+                if name == "Bash":
+                    tool_input = block.get("input")
+                    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+                    if isinstance(command, str) and command:
+                        tool_use_id = block.get("id")
+                        requested_ids.append(tool_use_id if isinstance(tool_use_id, str) else None)
+                        commands.append(command)
+                elif name in _HOOK_EDIT_TOOL_PATH_FIELDS:
                     tool_use_id = block.get("id")
-                    requested.append((tool_use_id if isinstance(tool_use_id, str) else None, command, position))
-            elif block_type == "tool_use" and block.get("name") in _HOOK_EDIT_TOOL_PATH_FIELDS:
-                position += 1
-                tool_use_id = block.get("id")
-                edit_positions[tool_use_id if isinstance(tool_use_id, str) else None] = position
+                    edit_cutoffs[tool_use_id if isinstance(tool_use_id, str) else None] = len(commands)
             elif block_type == "tool_result" and block.get("is_error"):
                 tool_use_id = block.get("tool_use_id")
-                text = _tool_result_text(block.get("content"))
-                if isinstance(tool_use_id, str) and all(marker in text for marker in _PRETOOLUSE_DENIAL_MARKERS):
+                if isinstance(tool_use_id, str) and all(
+                    marker in _tool_result_text(block.get("content")) for marker in _PRETOOLUSE_DENIAL_MARKERS
+                ):
                     denied_ids.add(tool_use_id)
 
-    last_edit_position = max(
-        (pos for tool_use_id, pos in edit_positions.items() if tool_use_id is None or tool_use_id not in denied_ids),
+    if not denied_ids:
+        return commands[max(edit_cutoffs.values(), default=0) :]
+    cutoff = max(
+        (count for tool_use_id, count in edit_cutoffs.items() if tool_use_id is None or tool_use_id not in denied_ids),
         default=0,
     )
     return [
         command
-        for tool_use_id, command, command_position in requested
-        if (tool_use_id is None or tool_use_id not in denied_ids) and command_position > last_edit_position
+        for tool_use_id, command in zip(requested_ids[cutoff:], commands[cutoff:], strict=True)
+        if tool_use_id is None or tool_use_id not in denied_ids
     ]
 
 
